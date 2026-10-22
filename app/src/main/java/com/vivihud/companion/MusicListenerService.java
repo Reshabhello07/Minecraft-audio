@@ -12,6 +12,9 @@ import android.media.session.PlaybackState;
 import android.os.SystemClock;
 import android.service.notification.NotificationListenerService;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -24,6 +27,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
@@ -44,6 +48,10 @@ public class MusicListenerService extends NotificationListenerService {
     private String artKey = "";
     private byte[] artPng;
     private int artColor = 0x55FF88;
+
+    // lyrics cache (synced LRC from lrclib.net)
+    private String lyricsKey = "";
+    private String lyricsLrc;
 
     @Override
     public void onCreate() {
@@ -125,6 +133,13 @@ public class MusicListenerService extends NotificationListenerService {
             }
             if (png == null) respond(o, "404 Not Found", "text/plain", new byte[0]);
             else respond(o, "200 OK", "image/png", png);
+        } else if (path.startsWith("/lyrics")) {
+            String lrc;
+            synchronized (this) {
+                lrc = lyricsLrc;
+            }
+            if (lrc == null) respond(o, "404 Not Found", "text/plain", new byte[0]);
+            else respond(o, "200 OK", "text/plain; charset=utf-8", lrc.getBytes(StandardCharsets.UTF_8));
         } else if (path.startsWith("/cmd")) {
             String c = "";
             int i = path.indexOf("c=");
@@ -211,9 +226,12 @@ public class MusicListenerService extends NotificationListenerService {
             if (pos < 0) pos = 0;
 
             updateArt(md, title, artist);
+            updateLyrics(title, artist, duration);
             int artHash;
             int color;
+            int lyrHash;
             synchronized (this) {
+                lyrHash = lyricsLrc != null ? lyricsKey.hashCode() | 1 : 0;
                 artHash = artPng != null ? artKey.hashCode() | 1 : 0;
                 color = artColor;
             }
@@ -226,12 +244,78 @@ public class MusicListenerService extends NotificationListenerService {
                     + ",\"duration\":" + Math.max(duration, 0)
                     + ",\"color\":" + color
                     + ",\"art\":" + artHash
+                    + ",\"lyr\":" + lyrHash
                     + ",\"pkg\":\"" + esc(pick.getPackageName()) + "\"}";
         } catch (SecurityException e) {
             return "{\"ok\":false,\"error\":\"no notification access\"}";
         } catch (Exception e) {
             return "{\"ok\":false,\"error\":\"internal\"}";
         }
+    }
+
+    // ---------- lyrics ----------
+
+    private void updateLyrics(String title, String artist, long durationMs) {
+        final String key = title + "|" + artist;
+        synchronized (this) {
+            if (key.equals(lyricsKey)) return;
+            lyricsKey = key;
+            lyricsLrc = null;
+        }
+        final String cleanTitle = title.replaceAll("\\s*[\\(\\[].*?[\\)\\]]", "").trim();
+        final String t0 = cleanTitle.isEmpty() ? title : cleanTitle;
+        final double durSec = durationMs / 1000.0;
+        Thread t = new Thread(() -> {
+            try {
+                String best = fetchLrc("https://lrclib.net/api/search?track_name="
+                        + URLEncoder.encode(t0, "UTF-8") + "&artist_name="
+                        + URLEncoder.encode(artist, "UTF-8"), durSec);
+                if (best == null) {
+                    best = fetchLrc("https://lrclib.net/api/search?q="
+                            + URLEncoder.encode(t0 + " " + artist, "UTF-8"), durSec);
+                }
+                if (best != null) {
+                    synchronized (this) {
+                        if (key.equals(lyricsKey)) lyricsLrc = best;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }, "vivihud-lyrics");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static String fetchLrc(String url, double durSec) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(5000);
+        c.setReadTimeout(6000);
+        c.setRequestProperty("User-Agent", "ViviHudCompanion/1.0");
+        String body;
+        try (InputStream in = c.getInputStream()) {
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+            body = bo.toString("UTF-8");
+        } finally {
+            c.disconnect();
+        }
+        JSONArray arr = new JSONArray(body);
+        String best = null;
+        double bestDiff = 1e9;
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject o = arr.getJSONObject(i);
+            String lrc = o.optString("syncedLyrics", "");
+            if (lrc.isEmpty() || lrc.equals("null")) continue;
+            double diff = durSec > 0 ? Math.abs(o.optDouble("duration", 0) - durSec) : 0;
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = lrc;
+            }
+        }
+        if (best != null && durSec > 0 && bestDiff > 8) return null;
+        return best;
     }
 
     // ---------- album art ----------
